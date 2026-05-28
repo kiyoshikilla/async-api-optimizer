@@ -1,0 +1,27 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+
+# Test caches
+.pytest_cache/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# Coverage
+.coverage
+coverage.xml
+
+# Tool caches
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Copilot instructions
+.github/copilot-instructions.md
