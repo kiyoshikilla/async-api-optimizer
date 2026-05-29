@@ -15,6 +15,16 @@ python -m async_api_optimizer.benchmark.harness
 The harness prints a text table and JSON output with p50/p95/p99 latency metrics.
 It also reports success and failure counts for each scenario, including the resilience chaos run.
 
+## Dashboard
+
+Launch the local dashboard (aiohttp-based UI):
+
+```bash
+python -m async_api_optimizer.benchmark.dashboard
+```
+
+Open http://127.0.0.1:8080 and press "Запустити бенчмарк" to see live charts.
+
 ## Tests
 
 Install dev dependencies and run pytest:
