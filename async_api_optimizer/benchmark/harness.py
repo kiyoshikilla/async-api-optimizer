@@ -5,22 +5,28 @@ import json
 import logging
 import sys
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from typing import Any
 
 import aiohttp
 
 from ..config import (
+    AdaptiveDispatcherConfig,
     BatcherConfig,
+    CircuitBreakerConfig,
     DispatcherConfig,
     ExecutorConfig,
     MockServerConfig,
     PoolConfig,
+    RetryConfig,
     ScenarioConfig,
     DEFAULT_SCENARIOS,
 )
 from ..core.batcher import Batcher
-from ..core.dispatcher import BoundedDispatcher
+from ..core.circuit_breaker import CircuitBreaker, CircuitBreakerOpenError
+from ..core.dispatcher import AdaptiveDispatcher, BoundedDispatcher
 from ..core.executor_bridge import ExecutorBridge
+from ..core.retry import with_retry
 from ..core.session_pool import SessionPool
 from .metrics import LatencyMetrics
 from .mock_server import start_mock_server
@@ -32,30 +38,53 @@ def _consume_bytes(data: bytes) -> int:
     return sum(data)
 
 
-async def _naive_request(url: str, pool_config: PoolConfig) -> float:
+async def _naive_request(url: str, pool_config: PoolConfig) -> tuple[float, bool]:
     start = asyncio.get_running_loop().time()
-    timeout = aiohttp.ClientTimeout(
-        total=None,
-        sock_connect=pool_config.connect_timeout,
-        sock_read=pool_config.read_timeout,
-    )
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url) as response:
-            await response.read()
-    return asyncio.get_running_loop().time() - start
+    ok = False
+    try:
+        timeout = aiohttp.ClientTimeout(
+            total=None,
+            sock_connect=pool_config.connect_timeout,
+            sock_read=pool_config.read_timeout,
+        )
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as response:
+                await response.read()
+                ok = 200 <= response.status < 300
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        ok = False
+    return asyncio.get_running_loop().time() - start, ok
 
 
 async def _pooled_request(
     pool: SessionPool,
     url: str,
     executor: ExecutorBridge | None,
-) -> float:
+    breaker: CircuitBreaker | None,
+    retry_config: RetryConfig | None,
+) -> tuple[float, bool]:
     start = asyncio.get_running_loop().time()
-    response = await pool.get(url)
-    data = await response.read()
-    if executor is not None:
-        await executor.run(_consume_bytes, data)
-    return asyncio.get_running_loop().time() - start
+    ok = False
+    try:
+        async def do_request() -> aiohttp.ClientResponse:
+            return await pool.get(url)
+
+        async def guarded_request() -> aiohttp.ClientResponse:
+            if breaker is None:
+                return await do_request()
+            return await breaker.call(do_request)
+
+        if retry_config is None:
+            response = await guarded_request()
+        else:
+            response = await with_retry(guarded_request, retry_config)
+        data = await response.read()
+        if executor is not None:
+            await executor.run(_consume_bytes, data)
+        ok = 200 <= response.status < 300
+    except (aiohttp.ClientError, asyncio.TimeoutError, CircuitBreakerOpenError):
+        ok = False
+    return asyncio.get_running_loop().time() - start, ok
 
 
 async def _batched_request(
@@ -63,13 +92,18 @@ async def _batched_request(
     url: str,
     batch: list[int],
     executor: ExecutorBridge | None,
-) -> tuple[float, int]:
+) -> tuple[float, int, bool]:
     start = asyncio.get_running_loop().time()
-    response = await pool.post(url, {"items": batch})
-    data = await response.read()
-    if executor is not None:
-        await executor.run(_consume_bytes, data)
-    return asyncio.get_running_loop().time() - start, len(batch)
+    ok = False
+    try:
+        response = await pool.post(url, {"items": batch})
+        data = await response.read()
+        if executor is not None:
+            await executor.run(_consume_bytes, data)
+        ok = 200 <= response.status < 300
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        ok = False
+    return asyncio.get_running_loop().time() - start, len(batch), ok
 
 
 async def _run_with_limit(
@@ -98,7 +132,7 @@ async def _run_with_limit(
 
 
 async def _run_with_dispatcher(
-    dispatcher: BoundedDispatcher | None,
+    dispatcher: BoundedDispatcher | AdaptiveDispatcher | None,
     factories: list[Callable[[], Awaitable[Any]]],
     limit: int,
 ) -> list[Any]:
@@ -121,20 +155,29 @@ async def _run_scenario(
     if not scenario.use_pool:
         factories = [lambda: _naive_request(url, pool_config) for _ in range(scenario.run.n)]
         durations = await _run_with_dispatcher(None, factories, scenario.run.concurrency)
-        for duration in durations:
-            metrics.record(duration)
+        for duration, ok in durations:
+            metrics.record(duration, success=ok)
         return metrics.summary()
 
-    dispatcher = (
-        BoundedDispatcher(
+    dispatcher: BoundedDispatcher | AdaptiveDispatcher | None
+    if scenario.use_adaptive_dispatcher:
+        dispatcher = AdaptiveDispatcher(
+            AdaptiveDispatcherConfig(
+                max_concurrency=scenario.run.concurrency,
+            )
+        )
+    elif scenario.use_dispatcher:
+        dispatcher = BoundedDispatcher(
             DispatcherConfig(
                 max_concurrency=scenario.run.concurrency,
                 warn_after=2.0,
             )
         )
-        if scenario.use_dispatcher
-        else None
-    )
+    else:
+        dispatcher = None
+
+    breaker = CircuitBreaker(CircuitBreakerConfig()) if scenario.use_circuit_breaker else None
+    retry_config = RetryConfig() if scenario.use_retry else None
 
     async with SessionPool(pool_config) as pool:
         if scenario.use_batcher:
@@ -144,7 +187,7 @@ async def _run_scenario(
                     executor = ExecutorBridge(executor_config)
                     await executor.__aenter__()
                 try:
-                    tasks: list[asyncio.Task[tuple[float, int]]] = []
+                    tasks: list[asyncio.Task[tuple[float, int, bool]]] = []
 
                     async def producer() -> None:
                         for i in range(scenario.run.n):
@@ -159,7 +202,7 @@ async def _run_scenario(
                             if not batch:
                                 continue
 
-                            async def send_batch(batch_items: list[int] = batch) -> tuple[float, int]:
+                            async def send_batch(batch_items: list[int] = batch) -> tuple[float, int, bool]:
                                 return await _batched_request(pool, batch_url, batch_items, executor)
 
                             if dispatcher is None:
@@ -169,9 +212,9 @@ async def _run_scenario(
 
                     await asyncio.gather(producer(), consume_batches())
                     results = await asyncio.gather(*tasks)
-                    for duration, count in results:
+                    for duration, count, ok in results:
                         for _ in range(count):
-                            metrics.record(duration)
+                            metrics.record(duration, success=ok)
                 finally:
                     if executor is not None:
                         await executor.__aexit__(None, None, None)
@@ -182,7 +225,7 @@ async def _run_scenario(
                 await executor.__aenter__()
             try:
                 factories = [
-                    lambda: _pooled_request(pool, url, executor)
+                    lambda: _pooled_request(pool, url, executor, breaker, retry_config)
                     for _ in range(scenario.run.n)
                 ]
                 durations = await _run_with_dispatcher(
@@ -190,8 +233,8 @@ async def _run_scenario(
                     factories,
                     scenario.run.concurrency,
                 )
-                for duration in durations:
-                    metrics.record(duration)
+                for duration, ok in durations:
+                    metrics.record(duration, success=ok)
             finally:
                 if executor is not None:
                     await executor.__aexit__(None, None, None)
@@ -200,7 +243,15 @@ async def _run_scenario(
 
 
 def _average_summaries(summaries: list[dict[str, float]]) -> dict[str, float]:
-    merged: dict[str, float] = {"count": 0.0, "avg": 0.0, "p50": 0.0, "p95": 0.0, "p99": 0.0}
+    merged: dict[str, float] = {
+        "count": 0.0,
+        "avg": 0.0,
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "success": 0.0,
+        "failure": 0.0,
+    }
     if not summaries:
         return merged
     for key in merged:
@@ -209,12 +260,14 @@ def _average_summaries(summaries: list[dict[str, float]]) -> dict[str, float]:
 
 
 def _render_table(results: dict[str, dict[str, float]]) -> str:
-    headers = ["scenario", "count", "avg", "p50", "p95", "p99"]
+    headers = ["scenario", "count", "success", "failure", "avg", "p50", "p95", "p99"]
     rows = [headers]
     for name, metrics in results.items():
         rows.append([
             name,
             f"{metrics['count']:.0f}",
+            f"{metrics['success']:.0f}",
+            f"{metrics['failure']:.0f}",
             f"{metrics['avg']*1000:.2f}ms",
             f"{metrics['p50']*1000:.2f}ms",
             f"{metrics['p95']*1000:.2f}ms",
@@ -241,11 +294,16 @@ async def run_benchmark(
         executor_config = executor_config or ExecutorConfig()
         mock_config = mock_config or MockServerConfig()
 
-        server = await start_mock_server(mock_config)
-        try:
-            results: dict[str, dict[str, float]] = {}
-            for scenario in scenarios:
-                logger.info("Running scenario %s", scenario.name)
+        results: dict[str, dict[str, float]] = {}
+        for scenario in scenarios:
+            logger.info("Running scenario %s", scenario.name)
+            scenario_mock = replace(
+                mock_config,
+                error_rate=scenario.error_rate,
+                spike_probability=scenario.spike_probability,
+            )
+            server = await start_mock_server(scenario_mock)
+            try:
                 summaries = []
                 for _ in range(scenario.run.repeats):
                     summary = await _run_scenario(
@@ -257,9 +315,9 @@ async def run_benchmark(
                     )
                     summaries.append(summary)
                 results[scenario.name] = _average_summaries(summaries)
-            return results
-        finally:
-            await server.close()
+            finally:
+                await server.close()
+        return results
     except asyncio.CancelledError:
         logger.warning("Benchmark cancelled")
         raise

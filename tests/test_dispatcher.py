@@ -1,10 +1,11 @@
 import asyncio
 import time
 
+import aiohttp
 import pytest
 
-from async_api_optimizer.config import DispatcherConfig, ExecutorConfig
-from async_api_optimizer.core.dispatcher import BoundedDispatcher
+from async_api_optimizer.config import AdaptiveDispatcherConfig, DispatcherConfig, ExecutorConfig
+from async_api_optimizer.core.dispatcher import AdaptiveDispatcher, BoundedDispatcher
 from async_api_optimizer.core.executor_bridge import ExecutorBridge
 
 
@@ -59,6 +60,68 @@ async def test_dispatcher_cancellation_releases() -> None:
     gate.set()
     result = await dispatcher.dispatch(lambda: asyncio.sleep(0.01, result=2))
     assert result == 2
+
+
+@pytest.mark.asyncio
+async def test_adaptive_dispatcher_increases_limit() -> None:
+    dispatcher = AdaptiveDispatcher(
+        AdaptiveDispatcherConfig(
+            max_concurrency=3,
+            min_concurrency=1,
+            target_latency=0.05,
+            critical_latency=0.5,
+        )
+    )
+
+    await dispatcher.dispatch(lambda: asyncio.sleep(0.001, result=1))
+    await dispatcher.dispatch(lambda: asyncio.sleep(0.001, result=1))
+
+    assert dispatcher.current_limit >= 2
+
+
+@pytest.mark.asyncio
+async def test_adaptive_dispatcher_decreases_on_slow() -> None:
+    dispatcher = AdaptiveDispatcher(
+        AdaptiveDispatcherConfig(
+            max_concurrency=4,
+            min_concurrency=1,
+            target_latency=0.01,
+            critical_latency=0.02,
+        )
+    )
+
+    await dispatcher.dispatch(lambda: asyncio.sleep(0.001, result=1))
+    await dispatcher.dispatch(lambda: asyncio.sleep(0.001, result=1))
+    before = dispatcher.current_limit
+
+    await dispatcher.dispatch(lambda: asyncio.sleep(0.05, result=1))
+    after = dispatcher.current_limit
+
+    assert after <= before
+
+
+@pytest.mark.asyncio
+async def test_adaptive_dispatcher_decreases_on_error() -> None:
+    dispatcher = AdaptiveDispatcher(
+        AdaptiveDispatcherConfig(
+            max_concurrency=4,
+            min_concurrency=1,
+            target_latency=0.01,
+            critical_latency=0.5,
+        )
+    )
+
+    await dispatcher.dispatch(lambda: asyncio.sleep(0.001, result=1))
+    before = dispatcher.current_limit
+
+    async def fail() -> int:
+        raise aiohttp.ClientError("boom")
+
+    with pytest.raises(aiohttp.ClientError):
+        await dispatcher.dispatch(fail)
+
+    after = dispatcher.current_limit
+    assert after <= before
 
 
 @pytest.mark.asyncio

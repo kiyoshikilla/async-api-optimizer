@@ -26,7 +26,13 @@ def create_app(config: MockServerConfig) -> web.Application:
         app = web.Application()
 
         async def work_handler(request: web.Request) -> web.Response:
-            delay_ms = random.randint(config.min_delay_ms, config.max_delay_ms)
+            if random.random() < config.error_rate:
+                return web.Response(status=random.choice([500, 502]))
+
+            if random.random() < config.spike_probability:
+                delay_ms = config.spike_delay_ms
+            else:
+                delay_ms = random.randint(config.min_delay_ms, config.max_delay_ms)
             await asyncio.sleep(delay_ms / 1000.0)
             logger.debug("Mock work delay %sms", delay_ms)
             return web.json_response({"ok": True, "delay_ms": delay_ms})
@@ -39,7 +45,13 @@ def create_app(config: MockServerConfig) -> web.Application:
                 count = len(payload)
             else:
                 count = 1
-            delay_ms = random.randint(config.min_delay_ms, config.max_delay_ms)
+            if random.random() < config.error_rate:
+                return web.Response(status=random.choice([500, 502]))
+
+            if random.random() < config.spike_probability:
+                delay_ms = config.spike_delay_ms
+            else:
+                delay_ms = random.randint(config.min_delay_ms, config.max_delay_ms)
             await asyncio.sleep(delay_ms / 1000.0)
             logger.debug("Mock batch delay %sms", delay_ms)
             return web.json_response({"ok": True, "count": count, "delay_ms": delay_ms})

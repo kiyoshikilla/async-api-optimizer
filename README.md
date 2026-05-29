@@ -1,8 +1,8 @@
 # Async API Optimizer
 
 Async API Optimizer provides a small async toolkit for measuring latency improvements from connection pooling,
-bounded dispatch, and request batching. The project targets Python 3.11+ and uses only stdlib, aiohttp, and
-pytest-asyncio.
+bounded dispatch, request batching, and resilience mechanisms (circuit breaker, adaptive backpressure, retry).
+The project targets Python 3.11+ and uses only stdlib, aiohttp, and pytest-asyncio.
 
 ## Benchmark
 
@@ -13,6 +13,7 @@ python -m async_api_optimizer.benchmark.harness
 ```
 
 The harness prints a text table and JSON output with p50/p95/p99 latency metrics.
+It also reports success and failure counts for each scenario, including the resilience chaos run.
 
 ## Tests
 
